@@ -1,4 +1,5 @@
 /* Copyright (C) 2012 Monty Program Ab
+   Copyright (C) 2022 Huawei Technologies Co., Ltd
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -12,8 +13,8 @@
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
-#ifndef THREADPOOL_INCLUDED
-#define THREADPOOL_INCLUDED
+#ifndef THREADPOOL_H_
+#define THREADPOOL_H_
 
 #include "sql/sql_class.h"
 #include "sql/mysqld_thd_manager.h"
@@ -39,8 +40,6 @@ extern uint threadpool_max_threads;
 extern uint threadpool_stall_limit;   /* time interval in 10 ms units for stall checks*/
 extern uint threadpool_oversubscribe; /* Maximum active threads in group */
 extern uint threadpool_toobusy;       /* Maximum active and waiting threads in group */
-extern uint threadpool_high_prio_tickets;
-extern ulong threadpool_high_prio_mode;
 
 /* Possible values for thread_pool_high_prio_mode */
 extern const char *threadpool_high_prio_mode_names[];
@@ -61,6 +60,7 @@ extern void tp_wait_end(THD *);
 extern void tp_post_kill_notification(THD *thd) noexcept;
 extern bool tp_add_connection(Channel_info *);
 extern void tp_end(void);
+extern void tp_fake_end(void);
 extern void threadpool_remove_connection(THD *thd);
 
 extern THD_event_functions tp_event_functions;
@@ -79,4 +79,8 @@ extern TP_STATISTICS tp_stats;
 extern void tp_set_threadpool_size(uint val) noexcept;
 extern void tp_set_threadpool_stall_limit(uint val) noexcept;
 
-#endif // THREADPOOL_INCLUDED
+extern uint tp_get_thdvar_high_prio_tickets(THD *thd);
+extern uint tp_get_thdvar_high_prio_mode(THD *thd);
+
+#endif // THREADPOOL_H_
+

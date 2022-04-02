@@ -1,4 +1,5 @@
 /* Copyright (C) 2012 Monty Program Ab
+   Copyright (C) 2022 Huawei Technologies Co., Ltd
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -12,29 +13,17 @@
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
-#include <atomic>
-
-#include <time.h>
-#include "my_sys.h"
-#include "my_systime.h"
-#include "mysql/thread_pool_priv.h"  // thd_is_transaction_active()
+#include "threadpool_unix.h"
 #include "sql/debug_sync.h"
 #include "sql/log.h"
 #include "sql/protocol_classic.h"
+#include "my_sys.h"
+#include "my_systime.h"
+#include "mysql/thread_pool_priv.h"  // thd_is_transaction_active()
+#include "mysql/plugin.h"
 #include "threadpool.h"
-
-#ifdef __linux__
-#include <sys/epoll.h>
-typedef struct epoll_event native_event;
-#endif
-#if defined(__FreeBSD__) || defined(__APPLE__)
-#include <sys/event.h>
-typedef struct kevent native_event;
-#endif
-#if defined(__sun)
-#include <port.h>
-typedef port_event_t native_event;
-#endif
+#include <atomic>
+#include <time.h>
 
 #define MYSQL_SERVER 1
 
@@ -44,8 +33,6 @@ typedef port_event_t native_event;
 /** Define if wait_begin() should create threads if necessary without waiting
 for stall detection to kick in */
 #define THREADPOOL_CREATE_THREADS_ON_WAIT
-
-#define my_microsecond_getsystime()    (my_getsystime()/10)
 
 /** Indicates that threadpool was initialized*/
 static bool threadpool_started = false;
@@ -77,72 +64,7 @@ static PSI_thread_info thread_list[] = {
      PSI_DOCUMENT_ME}};
 #endif  // HAVE_PSI_INTERFACE
 
-struct thread_group_t;
-
-/* Per-thread structure for workers */
-struct worker_thread_t {
-  ulonglong event_count; /* number of request handled by this thread */
-  thread_group_t *thread_group;
-  worker_thread_t *next_in_list;
-  worker_thread_t **prev_in_list;
-
-  mysql_cond_t cond;
-  bool woken;
-};
-
-typedef I_P_List<
-    worker_thread_t,
-    I_P_List_adapter<worker_thread_t, &worker_thread_t::next_in_list,
-                     &worker_thread_t::prev_in_list>>
-    worker_list_t;
-
-struct connection_t {
-  THD *thd;
-  thread_group_t *thread_group;
-  connection_t *next_in_queue;
-  connection_t **prev_in_queue;
-  ulonglong abs_wait_timeout;
-  bool logged_in;
-  bool bound_to_poll_descriptor;
-  bool waiting;
-  uint tickets;
-
-  uint threadpool_high_prio_tickets;
-  ulong threadpool_high_prio_mode;
-};
-
-typedef I_P_List<connection_t,
-                 I_P_List_adapter<connection_t, &connection_t::next_in_queue,
-                                  &connection_t::prev_in_queue>,
-                 I_P_List_null_counter, I_P_List_fast_push_back<connection_t>>
-    connection_queue_t;
-
-struct alignas(128) thread_group_t {
-  mysql_mutex_t mutex;
-  connection_queue_t queue;
-  connection_queue_t high_prio_queue;
-  worker_list_t waiting_threads;
-  worker_thread_t *listener;
-  pthread_attr_t *pthread_attr;
-  int pollfd;
-  int thread_count;
-  int active_thread_count;
-  int connection_count;
-  int waiting_thread_count;
-  /* Stats for the deadlock detection timer routine.*/
-  int io_event_count;
-  int queue_event_count;
-  ulonglong last_thread_creation_time;
-  int shutdown_pipe[2];
-  bool shutdown;
-  bool stalled;
-  char padding[328];
-};
-
-static_assert(sizeof(thread_group_t) == 512,
-              "sizeof(thread_group_t) must be 512 to avoid false sharing");
-
-static thread_group_t all_groups[MAX_THREAD_GROUPS];
+thread_group_t all_groups[MAX_THREAD_GROUPS];
 static uint group_count;
 
 /**
@@ -163,13 +85,16 @@ struct pool_timer_t {
 
 static pool_timer_t pool_timer;
 
+static std::atomic<int> threadpool_thds(0);
+
 static void queue_put(thread_group_t *thread_group, connection_t *connection);
-static int wake_thread(thread_group_t *thread_group) noexcept;
+static int wake_thread(thread_group_t *thread_group,
+                       bool due_to_stall) noexcept;
 static void handle_event(connection_t *connection);
 static int wake_or_create_thread(thread_group_t *thread_group,
-                                 bool admin_connection = false);
-static int create_worker(thread_group_t *thread_group,
-                         bool admin_connection = false) noexcept;
+                                 bool due_to_stall = false);
+static int create_worker(thread_group_t *thread_group, bool due_to_stall) noexcept;
+static void *admin_port_worker_main(void *param);
 static void *worker_main(void *param);
 static void check_stall(thread_group_t *thread_group);
 static void connection_abort(connection_t *connection);
@@ -184,11 +109,11 @@ int vio_cancel(Vio *vio, int how)
 
   if (vio->inactive == FALSE)
   {
-    DBUG_ASSERT(vio->type ==  VIO_TYPE_TCPIP ||
+    assert(vio->type ==  VIO_TYPE_TCPIP ||
       vio->type == VIO_TYPE_SOCKET ||
       vio->type == VIO_TYPE_SSL);
 
-    DBUG_ASSERT(mysql_socket_getfd(vio->mysql_socket) >= 0);
+    assert(mysql_socket_getfd(vio->mysql_socket) >= 0);
     if (mysql_socket_shutdown(vio->mysql_socket, how))
       r= -1;
   }
@@ -338,7 +263,6 @@ namespace {
   Prevent too many active threads executing at the same time, if the workload is
   not CPU bound.
 */
-
 inline bool too_many_active_threads(
     const thread_group_t &thread_group) noexcept {
   return (thread_group.active_thread_count >=
@@ -347,14 +271,13 @@ inline bool too_many_active_threads(
 }
 
 /*
-  Limit the number of 'busy' threads by 1 + thread_pool_oversubscribe. A thread
+  Limit the number of 'busy' threads by 1 + threadpool_toobusy. A thread
   is busy if it is in either the active state or the waiting state (i.e. between
   thd_wait_begin() / thd_wait_end() calls).
 */
-
 inline bool too_many_busy_threads(const thread_group_t &thread_group) noexcept {
   return (thread_group.active_thread_count + thread_group.waiting_thread_count >
-          1 + (int)threadpool_oversubscribe);
+          1 + (int)threadpool_toobusy);
 }
 
 /*
@@ -362,10 +285,8 @@ inline bool too_many_busy_threads(const thread_group_t &thread_group) noexcept {
    based on its current thread_pool_high_prio_mode value, available high
    priority tickets and transactional state and whether any locks are held.
 */
-
 inline bool connection_is_high_prio(const connection_t &c) noexcept {
-  // const ulong mode = c.thd->variables.threadpool_high_prio_mode;
-  const ulong mode = c.threadpool_high_prio_mode;  // !! todo
+  const ulong mode = tp_get_thdvar_high_prio_mode(c.thd);
 
   return (mode == TP_HIGH_PRIO_MODE_STATEMENTS) ||
          (mode == TP_HIGH_PRIO_MODE_TRANSACTIONS && c.tickets > 0 &&
@@ -380,9 +301,7 @@ inline bool connection_is_high_prio(const connection_t &c) noexcept {
 
 }  // namespace
 
-
 /* Dequeue element from a workqueue */
-
 static connection_t *queue_get(thread_group_t *thread_group) noexcept {
   DBUG_ENTER("queue_get");
   thread_group->queue_event_count++;
@@ -400,6 +319,26 @@ static connection_t *queue_get(thread_group_t *thread_group) noexcept {
     thread_group->queue.remove(c);
   }
   DBUG_RETURN(c);
+}
+
+static connection_t *queue_get(thread_group_t *group, operation_origin origin) {
+  connection_t *ret = queue_get(group);
+  if (ret != nullptr) {
+    TP_INCREMENT_GROUP_COUNTER(group, dequeues[(int)origin]);
+  }
+  return ret;
+}
+
+static inline void queue_push(thread_group_t *thread_group, connection_t *connection)
+{
+  connection->enqueue_time= pool_timer.current_microtime;
+  thread_group->queue.push_back(connection);
+}
+
+static inline void high_prio_queue_push(thread_group_t *thread_group, connection_t *connection)
+{
+  connection->enqueue_time= pool_timer.current_microtime;
+  thread_group->high_prio_queue.push_back(connection);
 }
 
 class Thd_timeout_checker : public Do_THD_Impl {
@@ -435,7 +374,6 @@ class Thd_timeout_checker : public Do_THD_Impl {
   Find connections that have been idle for too long and kill them.
   Also, recalculate time when next timeout check should run.
 */
-
 static void timeout_check(pool_timer_t *timer) {
   DBUG_ENTER("timeout_check");
 
@@ -464,7 +402,6 @@ static void timeout_check(pool_timer_t *timer) {
   TODO: Let the timer sleep for long time if there is no work to be done.
   Currently it wakes up rather often on and idle server.
 */
-
 static void *timer_thread(void *param) noexcept {
   my_thread_init();
   DBUG_ENTER("timer_thread");
@@ -503,7 +440,7 @@ static void *timer_thread(void *param) noexcept {
 
   mysql_mutex_destroy(&timer->mutex);
   my_thread_end();
-  return NULL;
+  return nullptr;
 }
 
 /*
@@ -530,7 +467,7 @@ static void check_stall(thread_group_t *thread_group) {
     was forgotten. Create a new worker(it will make itself listener).
   */
   if (!thread_group->listener && !thread_group->io_event_count) {
-    wake_or_create_thread(thread_group);
+    wake_or_create_thread(thread_group, true);
     mysql_mutex_unlock(&thread_group->mutex);
     return;
   }
@@ -567,7 +504,8 @@ static void check_stall(thread_group_t *thread_group) {
   */
   if (!thread_group->queue_event_count && !queues_are_empty(*thread_group)) {
     thread_group->stalled = true;
-    wake_or_create_thread(thread_group);
+    TP_INCREMENT_GROUP_COUNTER(thread_group, stalls);
+    wake_or_create_thread(thread_group, true);
   }
 
   /* Reset queue event count */
@@ -579,10 +517,10 @@ static void check_stall(thread_group_t *thread_group) {
 static void start_timer(pool_timer_t *timer) noexcept {
   my_thread_handle thread_id;
   DBUG_ENTER("start_timer");
-  mysql_mutex_init(key_timer_mutex, &timer->mutex, NULL);
+  mysql_mutex_init(key_timer_mutex, &timer->mutex, nullptr);
   mysql_cond_init(key_timer_cond, &timer->cond);
   timer->shutdown = false;
-  mysql_thread_create(key_timer_thread, &thread_id, NULL, timer_thread, timer);
+  mysql_thread_create(key_timer_thread, &thread_id, nullptr, timer_thread, timer);
   DBUG_VOID_RETURN;
 }
 
@@ -611,8 +549,9 @@ static connection_t *listener(thread_group_t *thread_group) {
     native_event ev[MAX_EVENTS];
     int cnt = io_poll_wait(thread_group->pollfd, ev, MAX_EVENTS, -1);
 
+    TP_INCREMENT_GROUP_COUNTER(thread_group, polls[LISTENER]);
     if (cnt <= 0) {
-      DBUG_ASSERT(thread_group->shutdown);
+      assert(thread_group->shutdown);
       break;
     }
 
@@ -684,22 +623,22 @@ static connection_t *listener(thread_group_t *thread_group) {
         c->tickets--;
         thread_group->high_prio_queue.push_back(c);
       } else {
-        // c->tickets = c->thd->variables.threadpool_high_prio_tickets;
-        c->tickets = c->threadpool_high_prio_tickets; // !! todo
-        thread_group->queue.push_back(c);
+        c->tickets = tp_get_thdvar_high_prio_tickets(c->thd);
+        queue_push(thread_group, c);
       }
     }
 
     if (listener_picks_event) {
       /* Handle the first event. */
       retval = (connection_t *)native_event_get_userdata(&ev[0]);
+      TP_INCREMENT_GROUP_COUNTER(thread_group, dequeues[LISTENER]);
       mysql_mutex_unlock(&thread_group->mutex);
       break;
     }
 
     if (thread_group->active_thread_count == 0) {
       /* We added some work items to queue, now wake a worker. */
-      if (wake_thread(thread_group)) {
+      if (wake_thread(thread_group, false)) {
         /*
           Wake failed, hence groups has no idle threads. Now check if there are
           any threads in the group except listener.
@@ -715,7 +654,7 @@ static connection_t *listener(thread_group_t *thread_group) {
             create thread, but waiting for timer would be an inefficient and
             pointless delay.
           */
-          create_worker(thread_group);
+          create_worker(thread_group, false);
         }
       }
     }
@@ -733,7 +672,6 @@ static connection_t *listener(thread_group_t *thread_group) {
   @param count -  1, when new thread is created
                  -1, when thread is about to exit
 */
-
 static void add_thread_count(thread_group_t *thread_group,
                              int32 count) noexcept {
   thread_group->thread_count += count;
@@ -750,16 +688,14 @@ static void add_thread_count(thread_group_t *thread_group,
   threadpool_max_threads, because we need at least 2 threads
   per group to prevent deadlocks (one listener + one worker)
 */
-
 static int create_worker(thread_group_t *thread_group,
-                         bool admin_connection) noexcept {
+                         bool due_to_stall) noexcept {
   my_thread_handle thread_id;
   bool max_threads_reached = false;
   int err;
 
   DBUG_ENTER("create_worker");
-  if (!admin_connection &&
-      tp_stats.num_worker_threads.load(std::memory_order_relaxed) >=
+  if (tp_stats.num_worker_threads.load(std::memory_order_relaxed) >=
           (int)threadpool_max_threads &&
       thread_group->thread_count >= 2) {
     err = 1;
@@ -774,15 +710,21 @@ static int create_worker(thread_group_t *thread_group,
     thread_group->last_thread_creation_time = my_microsecond_getsystime();
     Global_THD_manager::get_instance()->inc_thread_created();
     add_thread_count(thread_group, 1);
+    TP_INCREMENT_GROUP_COUNTER(thread_group, thread_creations);
+
+    if (due_to_stall) {
+      TP_INCREMENT_GROUP_COUNTER(thread_group, thread_creations_due_to_stall);
+    }
   } else {
     set_my_errno(errno);
   }
 
 end:
-  if (err)
+  if (err) {
     print_pool_blocked_message(max_threads_reached);
-  else
+  } else {
     pool_block_start = 0; /* Reset pool blocked timer, if it was set */
+  }
 
   DBUG_RETURN(err);
 }
@@ -817,29 +759,26 @@ static ulonglong microsecond_throttling_interval(
 
   Worker creation is throttled, so we avoid too many threads
   to be created during the short time.
-
-  If admin_connection is true, a new thread is created regardless of any other
-  limits.
 */
 static int wake_or_create_thread(thread_group_t *thread_group,
-                                 bool admin_connection) {
+                                 bool due_to_stall) {
   DBUG_ENTER("wake_or_create_thread");
 
   if (thread_group->shutdown) DBUG_RETURN(0);
 
-  if (wake_thread(thread_group) == 0) DBUG_RETURN(0);
+  if (wake_thread(thread_group, due_to_stall) == 0) DBUG_RETURN(0);
 
   if (thread_group->thread_count > thread_group->connection_count)
     DBUG_RETURN(-1);
 
-  if (thread_group->active_thread_count == 0 || admin_connection) {
+  if (thread_group->active_thread_count == 0) {
     /*
      We're better off creating a new thread here  with no delay, either there
      are no workers at all, or they all are all blocking and there was no
      idle  thread to wakeup. Smells like a potential deadlock or very slowly
      executing requests, e.g sleeps or user locks.
     */
-    DBUG_RETURN(create_worker(thread_group, admin_connection));
+    DBUG_RETURN(create_worker(thread_group, due_to_stall));
   }
 
   const ulonglong now = my_microsecond_getsystime();
@@ -849,9 +788,10 @@ static int wake_or_create_thread(thread_group_t *thread_group,
   /* Throttle thread creation. */
   if (time_since_last_thread_created >
       microsecond_throttling_interval(*thread_group)) {
-    DBUG_RETURN(create_worker(thread_group));
+    DBUG_RETURN(create_worker(thread_group, due_to_stall));
   }
 
+  TP_INCREMENT_GROUP_COUNTER(thread_group, throttles);
   DBUG_RETURN(-1);
 }
 
@@ -859,10 +799,20 @@ static int thread_group_init(thread_group_t *thread_group,
                              pthread_attr_t *thread_attr) noexcept {
   DBUG_ENTER("thread_group_init");
   thread_group->pthread_attr = thread_attr;
-  mysql_mutex_init(key_group_mutex, &thread_group->mutex, NULL);
+  mysql_mutex_init(key_group_mutex, &thread_group->mutex, nullptr);
   thread_group->pollfd = -1;
   thread_group->shutdown_pipe[0] = -1;
   thread_group->shutdown_pipe[1] = -1;
+  thread_group->thread_count = 0;
+  thread_group->admin_port_thread_count = 0;
+  thread_group->dump_thread_count = 0;
+  thread_group->active_thread_count = 0;
+  thread_group->connection_count = 0;
+  thread_group->waiting_thread_count = 0;
+  thread_group->io_event_count = 0;
+  thread_group->queue_event_count = 0;
+  thread_group->shutdown = false;
+  thread_group->stalled = false;
   DBUG_RETURN(0);
 }
 
@@ -883,14 +833,17 @@ static void thread_group_destroy(thread_group_t *thread_group) noexcept {
 /**
   Wake sleeping thread from waiting list
 */
-
-static int wake_thread(thread_group_t *thread_group) noexcept {
+static int wake_thread(thread_group_t *thread_group, bool due_to_stall) noexcept {
   DBUG_ENTER("wake_thread");
   worker_thread_t *thread = thread_group->waiting_threads.front();
   if (thread) {
     thread->woken = true;
     thread_group->waiting_threads.remove(thread);
     mysql_cond_signal(&thread->cond);
+    TP_INCREMENT_GROUP_COUNTER(thread_group, wakes);
+    if (due_to_stall) {
+      TP_INCREMENT_GROUP_COUNTER(thread_group, wakes_due_to_stall);
+    }
     DBUG_RETURN(0);
   }
   DBUG_RETURN(1); /* no thread in waiter list => missed wakeup */
@@ -899,7 +852,6 @@ static int wake_thread(thread_group_t *thread_group) noexcept {
 /**
   Shutdown for thread group
 */
-
 static void thread_group_close(thread_group_t *thread_group) noexcept {
   DBUG_ENTER("thread_group_close");
 
@@ -919,8 +871,8 @@ static void thread_group_close(thread_group_t *thread_group) noexcept {
   }
 
   /* Wake listener */
-  if (io_poll_associate_fd(thread_group->pollfd, thread_group->shutdown_pipe[0],
-                           nullptr)) {
+  if (io_poll_associate_fd(thread_group->pollfd,
+        thread_group->shutdown_pipe[0], nullptr)) {
     mysql_mutex_unlock(&thread_group->mutex);
     DBUG_VOID_RETURN;
   }
@@ -931,20 +883,20 @@ static void thread_group_close(thread_group_t *thread_group) noexcept {
   }
 
   /* Wake all workers. */
-  while (wake_thread(thread_group) == 0) {
+  while (wake_thread(thread_group, false) == 0) {
   }
 
   mysql_mutex_unlock(&thread_group->mutex);
 
-  mysql_mutex_lock(&thread_group->mutex);
-  while (thread_group->thread_count > 0) {
-    mysql_mutex_unlock(&thread_group->mutex);
-    my_sleep(10000);
-    mysql_mutex_lock(&thread_group->mutex);
-  }
-  mysql_mutex_unlock(&thread_group->mutex);
+  // mysql_mutex_lock(&thread_group->mutex);
+  // while (thread_group->thread_count > 0) {
+  //   mysql_mutex_unlock(&thread_group->mutex);
+  //   my_sleep(10000);
+  //   mysql_mutex_lock(&thread_group->mutex);
+  // }
+  // mysql_mutex_unlock(&thread_group->mutex);
 
-  thread_group_destroy(thread_group);
+  // thread_group_destroy(thread_group);
 
   DBUG_VOID_RETURN;
 }
@@ -954,20 +906,19 @@ static void thread_group_close(thread_group_t *thread_group) noexcept {
 
   Currently, this function is only used when new connections need to
   perform login (this is done in worker threads).
-
 */
-
 static void queue_put(thread_group_t *thread_group, connection_t *connection) {
   DBUG_ENTER("queue_put");
 
   mysql_mutex_lock(&thread_group->mutex);
-  // connection->tickets = connection->thd->variables.threadpool_high_prio_tickets;
-  connection->tickets = connection->threadpool_high_prio_tickets; // !! todo
+  connection->tickets = tp_get_thdvar_high_prio_tickets(connection->thd);
+  connection->enqueue_time = pool_timer.current_microtime;
 
-  thread_group->queue.push_back(connection);
+  queue_push(thread_group, connection);
 
-  if (thread_group->active_thread_count == 0)
-    wake_or_create_thread(thread_group, connection->thd->is_admin_connection());
+  if (thread_group->active_thread_count == 0) {
+    wake_or_create_thread(thread_group, false);
+  }
 
   mysql_mutex_unlock(&thread_group->mutex);
 
@@ -981,7 +932,7 @@ static void queue_put(thread_group_t *thread_group, connection_t *connection) {
   (if connection is not yet logged in), or there are unread bytes on the socket.
 
   If there are no pending events currently, thread will wait.
-  If timeout specified in abstime parameter passes, the function returns NULL.
+  If timeout specified in abstime parameter passes, the function returns nullptr.
 
   @param current_thread - current worker thread
   @param thread_group - current thread group
@@ -989,9 +940,8 @@ static void queue_put(thread_group_t *thread_group, connection_t *connection) {
 
   @return
   connection with pending event.
-  NULL is returned if timeout has expired,or on shutdown.
+  nullptr is returned if timeout has expired,or on shutdown.
 */
-
 static connection_t *get_event(worker_thread_t *current_thread,
                                thread_group_t *thread_group,
                                struct timespec *abstime) {
@@ -1000,7 +950,7 @@ static connection_t *get_event(worker_thread_t *current_thread,
   int err = 0;
 
   mysql_mutex_lock(&thread_group->mutex);
-  DBUG_ASSERT(thread_group->active_thread_count >= 0);
+  assert(thread_group->active_thread_count >= 0);
 
   for (;;) {
     const bool oversubscribed = too_many_active_threads(*thread_group);
@@ -1008,11 +958,11 @@ static connection_t *get_event(worker_thread_t *current_thread,
 
     /* Check if queue is not empty */
     if (!oversubscribed) {
-      connection = queue_get(thread_group);
+      connection = queue_get(thread_group, WORKER);
       if (connection) break;
     }
 
-    /* If there is  currently no listener in the group, become one. */
+    /* If there is currently no listener in the group, become one. */
     if (!thread_group->listener) {
       thread_group->listener = current_thread;
       thread_group->active_thread_count--;
@@ -1035,6 +985,7 @@ static connection_t *get_event(worker_thread_t *current_thread,
       native_event nev;
       if (io_poll_wait(thread_group->pollfd, &nev, 1, 0) == 1) {
         thread_group->io_event_count++;
+        TP_INCREMENT_GROUP_COUNTER(thread_group, polls[WORKER]);
         connection = (connection_t *)native_event_get_userdata(&nev);
 
         /*
@@ -1051,17 +1002,13 @@ static connection_t *get_event(worker_thread_t *current_thread,
             Not eligible for high priority processing. Restore tickets and put
             it into the low priority queue.
           */
-
-          // connection->tickets =
-          //     connection->thd->variables.threadpool_high_prio_tickets;
-          connection->tickets =
-              connection->threadpool_high_prio_tickets; // !! todo
-
+          connection->tickets = tp_get_thdvar_high_prio_tickets(connection->thd);
           thread_group->queue.push_back(connection);
           connection = nullptr;
         }
 
         if (connection) {
+          TP_INCREMENT_GROUP_COUNTER(thread_group, dequeues[WORKER]);
           thread_group->queue_event_count++;
           break;
         }
@@ -1116,8 +1063,8 @@ static void wait_begin(thread_group_t *thread_group) noexcept {
   thread_group->active_thread_count--;
   thread_group->waiting_thread_count++;
 
-  DBUG_ASSERT(thread_group->active_thread_count >= 0);
-  DBUG_ASSERT(thread_group->connection_count > 0);
+  assert(thread_group->active_thread_count >= 0);
+  assert(thread_group->connection_count > 0);
 
 #ifdef THREADPOOL_CREATE_THREADS_ON_WAIT
   if ((thread_group->active_thread_count == 0) &&
@@ -1137,7 +1084,6 @@ static void wait_begin(thread_group_t *thread_group) noexcept {
 /**
   Tells the pool has finished waiting.
 */
-
 static void wait_end(thread_group_t *thread_group) noexcept {
   DBUG_ENTER("wait_end");
   mysql_mutex_lock(&thread_group->mutex);
@@ -1157,7 +1103,7 @@ static connection_t *alloc_connection(THD *thd) noexcept {
 
   connection_t *connection = (connection_t *)my_malloc(
       PSI_NOT_INSTRUMENTED /*key_memory_thread_pool_connection*/,
-      sizeof(connection_t), 0); // !! todo
+      sizeof(connection_t), 0);
   if (connection) {
     connection->thd = thd;
     connection->waiting = false;
@@ -1187,8 +1133,9 @@ bool tp_add_connection(
   connection_t *const connection = alloc_connection(thd);
 
   if (unlikely(!connection)) {
-    // thd->get_protocol_classic()->end_net(); // !! todo
+    thd->get_protocol_classic()->end_net();
     delete thd;
+    // channel will be closed by send_error_and_close_channel()
     channel_info->send_error_and_close_channel(ER_OUT_OF_RESOURCES, 0, false);
     DBUG_RETURN(true);
   }
@@ -1198,6 +1145,7 @@ bool tp_add_connection(
   thd->set_new_thread_id();
   thd->start_utime = my_micro_time();
 
+  threadpool_thds++;
   Global_THD_manager::get_instance()->add_thd(thd);
 
   thd->scheduler.data = connection;
@@ -1207,33 +1155,51 @@ bool tp_add_connection(
 
   connection->thread_group = group;
 
-  mysql_mutex_lock(&group->mutex);
-  group->connection_count++;
-  mysql_mutex_unlock(&group->mutex);
+  if (thd->is_admin_connection()) {
+    my_thread_handle thread_id;
+    mysql_mutex_lock(&group->mutex);
+    int err = mysql_thread_create(key_worker_thread, &thread_id,
+                group->pthread_attr, admin_port_worker_main, connection);
 
-  /*
-    Add connection to the work queue. Actual login
-    will be done by a worker thread.
-  */
-  queue_put(group, connection);
+    if (err) {
+      set_my_errno(errno);
+      print_pool_blocked_message(false);
+    } else {
+      group->admin_port_thread_count++;
+    }
+    mysql_mutex_unlock(&group->mutex);
+  } else {
+    mysql_mutex_lock(&group->mutex);
+    group->connection_count++;
+    mysql_mutex_unlock(&group->mutex);
+
+    /*
+      Add connection to the work queue. Actual login
+      will be done by a worker thread.
+    */
+    queue_put(group, connection);
+  }
+
   DBUG_RETURN(false);
 }
 
 /**
   Terminate connection.
 */
-
 static void connection_abort(connection_t *connection) {
   DBUG_ENTER("connection_abort");
   thread_group_t *group = connection->thread_group;
-
+  bool is_admin_port = connection->thd->is_admin_connection();
   threadpool_remove_connection(connection->thd);
 
-  mysql_mutex_lock(&group->mutex);
-  group->connection_count--;
-  mysql_mutex_unlock(&group->mutex);
+  if (!is_admin_port) {
+    mysql_mutex_lock(&group->mutex);
+    group->connection_count--;
+    mysql_mutex_unlock(&group->mutex);
+  }
 
   my_free(connection);
+  threadpool_thds--;
   DBUG_VOID_RETURN;
 }
 
@@ -1243,17 +1209,20 @@ static void connection_abort(connection_t *connection) {
 
 void tp_post_kill_notification(THD *thd) noexcept {
   DBUG_ENTER("tp_post_kill_notification");
-  if (current_thd == thd || thd->system_thread) DBUG_VOID_RETURN;
+  if (current_thd == thd || thd->system_thread) {
+    DBUG_VOID_RETURN;
+  }
 
   Vio *vio = thd->get_protocol_classic()->get_vio();
   if (vio) vio_cancel(vio, SHUT_RD);
   DBUG_VOID_RETURN;
 }
 
+alignas(CPU_LEVEL1_DCACHE_LINESIZE) std::atomic<uint64_t> tp_waits[THD_WAIT_LAST];
+
 /**
   MySQL scheduler callback: wait begin
 */
-
 void tp_wait_begin(THD *thd, int type MY_ATTRIBUTE((unused))) {
   DBUG_ENTER("tp_wait_begin");
 
@@ -1262,9 +1231,13 @@ void tp_wait_begin(THD *thd, int type MY_ATTRIBUTE((unused))) {
   }
 
   connection_t *connection = (connection_t *)thd->scheduler.data;
-  if (connection) {
-    DBUG_ASSERT(!connection->waiting);
+
+  if (connection && connection->thd &&
+      !connection->thd->is_admin_connection()) {
+    assert(!connection->waiting);
     connection->waiting = true;
+    assert(type > 0 && type < THD_WAIT_LAST);
+    tp_waits[type]++;
     wait_begin(connection->thread_group);
   }
   DBUG_VOID_RETURN;
@@ -1281,8 +1254,10 @@ void tp_wait_end(THD *thd) {
     DBUG_VOID_RETURN;
   }
   connection_t *connection = (connection_t *)thd->scheduler.data;
-  if (connection) {
-    DBUG_ASSERT(connection->waiting);
+
+  if (connection && connection->thd &&
+      !connection->thd->is_admin_connection()) {
+    assert(connection->waiting);
     connection->waiting = false;
     wait_end(connection->thread_group);
   }
@@ -1301,10 +1276,6 @@ static void set_next_timeout_check(ulonglong abstime) {
 
 
   inline ulong get_wait_timeout(THD *thd) noexcept {
-    // if (in_active_multi_stmt_transaction() &&
-    //     kill_idle_transaction_timeout > 0 &&
-    //     kill_idle_transaction_timeout < thd->variables.net_wait_timeout)
-    //   return thd->kill_idle_transaction_timeout;
     return thd->variables.net_wait_timeout;
   }
 
@@ -1339,7 +1310,7 @@ static void set_wait_timeout(connection_t *c) noexcept {
 
 static int change_group(connection_t *c, thread_group_t *old_group,
                         thread_group_t *new_group) {
-  DBUG_ASSERT(c->thread_group == old_group);
+  assert(c->thread_group == old_group);
 
   /* Remove connection from the old group. */
   if (c->bound_to_poll_descriptor) {
@@ -1360,7 +1331,7 @@ static int change_group(connection_t *c, thread_group_t *old_group,
   new_group->connection_count++;
   /* Ensure that there is a listener in the new group. */
   int ret = 0;
-  if (!new_group->thread_count) ret = create_worker(new_group);
+  if (!new_group->thread_count) ret = create_worker(new_group, false);
   mysql_mutex_unlock(&new_group->mutex);
   return ret;
 }
@@ -1398,36 +1369,74 @@ static int start_io(connection_t *connection) {
 
 static void handle_event(connection_t *connection) {
   DBUG_ENTER("handle_event");
-  int err;
+  int err = 0;
 
-  if (!connection->logged_in) {
-    err = threadpool_add_connection(connection->thd);
-    connection->logged_in = true;
-  } else {
-    err = threadpool_process_request(connection->thd);
+  while (1) {
+    if (!connection->logged_in) {
+      err = threadpool_add_connection(connection->thd);
+      connection->logged_in = true;
+    } else {
+      err = threadpool_process_request(connection->thd);
+    }
+
+    if (err) {
+      goto end;
+    }
+
+    set_wait_timeout(connection);
+
+    if (connection->thd->is_admin_connection()) {
+    } else {
+      break;
+    }
   }
 
-  if (err) goto end;
-
-  set_wait_timeout(connection);
-  err = start_io(connection);
+  if (!connection->thd->is_admin_connection()) {
+    err = start_io(connection);
+  }
 
 end:
-  if (err) connection_abort(connection);
+  if (err || connection->thd->is_admin_connection()) {
+    connection_abort(connection);
+  }
 
   DBUG_VOID_RETURN;
+}
+
+static void *admin_port_worker_main(void *param) {
+  my_thread_init();
+  DBUG_ENTER("admin_port_worker_main");
+
+#ifdef HAVE_PSI_THREAD_INTERFACE
+  PSI_THREAD_CALL(set_thread_account)
+  (nullptr, 0, nullptr, 0);
+#endif
+
+  connection_t *connection = static_cast<connection_t *>(param);
+  assert(connection != nullptr);
+  assert(connection->thread_group != nullptr);
+  thread_group_t *group = connection->thread_group;
+
+  handle_event(connection);
+
+  mysql_mutex_lock(&group->mutex);
+  group->admin_port_thread_count--;
+  mysql_mutex_unlock(&group->mutex);
+
+  my_thread_end();
+  return nullptr;
 }
 
 /**
   Worker thread's main
 */
-
 static void *worker_main(void *param) {
   my_thread_init();
 
   DBUG_ENTER("worker_main");
 
-  thread_group_t *thread_group = (thread_group_t *)param;
+  thread_group_t *thread_group = static_cast<thread_group_t *>(param);
+  assert(thread_group != nullptr);
 
   /* Init per-thread structure */
   worker_thread_t this_thread;
@@ -1437,16 +1446,19 @@ static void *worker_main(void *param) {
 
 #ifdef HAVE_PSI_THREAD_INTERFACE
   PSI_THREAD_CALL(set_thread_account)
-  (NULL, 0, NULL, 0);
+  (nullptr, 0, nullptr, 0);
 #endif
 
   /* Run event loop */
   for (;;) {
-    connection_t *connection;
     struct timespec ts;
     set_timespec(&ts, threadpool_idle_timeout);
-    connection = get_event(&this_thread, thread_group, &ts);
-    if (!connection) break;
+    connection_t *connection = get_event(&this_thread, thread_group, &ts);
+
+    if (!connection) {
+      break;
+    }
+  
     this_thread.event_count++;
     handle_event(connection);
   }
@@ -1454,9 +1466,16 @@ static void *worker_main(void *param) {
   /* Thread shutdown: cleanup per-worker-thread structure. */
   mysql_cond_destroy(&this_thread.cond);
 
+  bool last_thread = false;                    /* last thread in group exits */
   mysql_mutex_lock(&thread_group->mutex);
   add_thread_count(thread_group, -1);
+  last_thread= ((thread_group->thread_count == 0) && thread_group->shutdown);
   mysql_mutex_unlock(&thread_group->mutex);
+
+  /* Last thread in group exits and pool is terminating, destroy group.*/
+  if (last_thread) {
+    thread_group_destroy(thread_group);
+  }
 
   my_thread_end();
   return nullptr;
@@ -1486,21 +1505,32 @@ bool tp_init() {
   DBUG_RETURN(false);
 }
 
-void tp_end() {
-  DBUG_ENTER("tp_end");
+void tp_end_thread() {
+  if (!threadpool_started) {
+    return;
+  }
 
-  if (!threadpool_started) DBUG_VOID_RETURN;
+  while (threadpool_thds > 0) {
+    sleep(2);
+  }
 
   stop_timer(&pool_timer);
+
   for (uint i = 0; i < array_elements(all_groups); i++) {
     thread_group_close(&all_groups[i]);
   }
+
   threadpool_started = false;
+}
+
+void tp_end() {
+  DBUG_ENTER("tp_end");
+  std::thread exit_tp(tp_end_thread);
+  exit_tp.detach();
   DBUG_VOID_RETURN;
 }
 
 /** Ensure that poll descriptors are created when threadpool_size changes */
-
 void tp_set_threadpool_size(uint size) noexcept {
   if (!threadpool_started) return;
 
@@ -1526,7 +1556,10 @@ void tp_set_threadpool_size(uint size) noexcept {
 }
 
 void tp_set_threadpool_stall_limit(uint limit) noexcept {
-  if (!threadpool_started) return;
+  if (!threadpool_started) {
+    return;
+  }
+
   mysql_mutex_lock(&(pool_timer.mutex));
   pool_timer.tick_interval = limit;
   mysql_mutex_unlock(&(pool_timer.mutex));
@@ -1539,7 +1572,6 @@ void tp_set_threadpool_stall_limit(uint limit) noexcept {
  Sum idle threads over all groups.
  Don't do any locking, it is not required for stats.
 */
-
 int tp_get_idle_thread_count() noexcept {
   int sum = 0;
   for (uint i = 0;
@@ -1575,10 +1607,9 @@ A likely cause of pool blocks are clients that lock resources for long time. \
  It will be just a single message for each blocking situation (to prevent
  log flood).
 */
-
 static void print_pool_blocked_message(bool max_threads_reached) noexcept {
   ulonglong now = my_microsecond_getsystime();
-  static bool msg_written;
+  static bool msg_written = false;
 
   if (pool_block_start == 0) {
     pool_block_start = now;
