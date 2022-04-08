@@ -85,8 +85,6 @@ struct pool_timer_t {
 
 static pool_timer_t pool_timer;
 
-static std::atomic<int> threadpool_thds(0);
-
 static void queue_put(thread_group_t *thread_group, connection_t *connection);
 static int wake_thread(thread_group_t *thread_group,
                        bool due_to_stall) noexcept;
@@ -101,6 +99,51 @@ static void connection_abort(connection_t *connection);
 static void set_next_timeout_check(ulonglong abstime);
 static void print_pool_blocked_message(bool) noexcept;
 
+class ThreadPoolConnSet {
+public:
+  ThreadPoolConnSet() {};
+  virtual ~ThreadPoolConnSet() {};
+
+  bool empty() {
+    bool ret = false;
+    mtx.lock();
+    ret = conns.empty();
+    mtx.unlock();
+    return ret;
+  }
+
+  void killConns() {
+    mtx.lock();
+    for (auto &it: conns) {
+      THD *thd = it->thd;
+      if (thd->killed != THD::KILL_CONNECTION) {
+        mysql_mutex_lock(&thd->LOCK_thd_data);
+        thd->killed = THD::KILL_CONNECTION;
+        tp_post_kill_notification(thd);
+        mysql_mutex_unlock(&thd->LOCK_thd_data);
+      }
+    }
+    mtx.unlock();
+  }
+
+  void insert(connection_t *c) {
+    mtx.lock();
+    conns.insert(c);
+    mtx.unlock();
+  }
+
+  void erase(connection_t *c) {
+    mtx.lock();
+    conns.erase(c);
+    mtx.unlock();
+  }
+
+public:
+  std::set<connection_t *> conns;
+  std::mutex mtx;
+};
+
+ThreadPoolConnSet threadpool_thds;
 
 int vio_cancel(Vio *vio, int how)
 {
@@ -888,15 +931,15 @@ static void thread_group_close(thread_group_t *thread_group) noexcept {
 
   mysql_mutex_unlock(&thread_group->mutex);
 
-  // mysql_mutex_lock(&thread_group->mutex);
-  // while (thread_group->thread_count > 0) {
-  //   mysql_mutex_unlock(&thread_group->mutex);
-  //   my_sleep(10000);
-  //   mysql_mutex_lock(&thread_group->mutex);
-  // }
-  // mysql_mutex_unlock(&thread_group->mutex);
+  mysql_mutex_lock(&thread_group->mutex);
+  while (thread_group->thread_count > 0) {
+    mysql_mutex_unlock(&thread_group->mutex);
+    my_sleep(10000);
+    mysql_mutex_lock(&thread_group->mutex);
+  }
+  mysql_mutex_unlock(&thread_group->mutex);
 
-  // thread_group_destroy(thread_group);
+  thread_group_destroy(thread_group);
 
   DBUG_VOID_RETURN;
 }
@@ -1145,7 +1188,7 @@ bool tp_add_connection(
   thd->set_new_thread_id();
   thd->start_utime = my_micro_time();
 
-  threadpool_thds++;
+  threadpool_thds.insert(connection);
   Global_THD_manager::get_instance()->add_thd(thd);
 
   thd->scheduler.data = connection;
@@ -1188,6 +1231,8 @@ bool tp_add_connection(
 */
 static void connection_abort(connection_t *connection) {
   DBUG_ENTER("connection_abort");
+  threadpool_thds.erase(connection);
+
   thread_group_t *group = connection->thread_group;
   bool is_admin_port = connection->thd->is_admin_connection();
   threadpool_remove_connection(connection->thd);
@@ -1199,7 +1244,6 @@ static void connection_abort(connection_t *connection) {
   }
 
   my_free(connection);
-  threadpool_thds--;
   DBUG_VOID_RETURN;
 }
 
@@ -1466,16 +1510,9 @@ static void *worker_main(void *param) {
   /* Thread shutdown: cleanup per-worker-thread structure. */
   mysql_cond_destroy(&this_thread.cond);
 
-  bool last_thread = false;                    /* last thread in group exits */
   mysql_mutex_lock(&thread_group->mutex);
   add_thread_count(thread_group, -1);
-  last_thread= ((thread_group->thread_count == 0) && thread_group->shutdown);
   mysql_mutex_unlock(&thread_group->mutex);
-
-  /* Last thread in group exits and pool is terminating, destroy group.*/
-  if (last_thread) {
-    thread_group_destroy(thread_group);
-  }
 
   my_thread_end();
   return nullptr;
@@ -1510,8 +1547,10 @@ void tp_end_thread() {
     return;
   }
 
-  while (threadpool_thds > 0) {
-    sleep(2);
+  threadpool_thds.killConns();
+
+  while (!threadpool_thds.empty()) {
+    my_sleep(10000);
   }
 
   stop_timer(&pool_timer);
