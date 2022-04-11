@@ -116,7 +116,7 @@ public:
     mtx.lock();
     for (auto &it: conns) {
       THD *thd = it->thd;
-      if (thd->killed != THD::KILL_CONNECTION) {
+      if (current_thd != thd && thd->killed != THD::KILL_CONNECTION) {
         mysql_mutex_lock(&thd->LOCK_thd_data);
         thd->killed = THD::KILL_CONNECTION;
         tp_post_kill_notification(thd);
@@ -930,17 +930,6 @@ static void thread_group_close(thread_group_t *thread_group) noexcept {
   }
 
   mysql_mutex_unlock(&thread_group->mutex);
-
-  mysql_mutex_lock(&thread_group->mutex);
-  while (thread_group->thread_count > 0) {
-    mysql_mutex_unlock(&thread_group->mutex);
-    my_sleep(10000);
-    mysql_mutex_lock(&thread_group->mutex);
-  }
-  mysql_mutex_unlock(&thread_group->mutex);
-
-  thread_group_destroy(thread_group);
-
   DBUG_VOID_RETURN;
 }
 
@@ -1510,9 +1499,16 @@ static void *worker_main(void *param) {
   /* Thread shutdown: cleanup per-worker-thread structure. */
   mysql_cond_destroy(&this_thread.cond);
 
+  bool last_thread = false;                    /* last thread in group exits */
   mysql_mutex_lock(&thread_group->mutex);
   add_thread_count(thread_group, -1);
+  last_thread= ((thread_group->thread_count == 0) && thread_group->shutdown);
   mysql_mutex_unlock(&thread_group->mutex);
+
+  /* Last thread in group exits and pool is terminating, destroy group.*/
+  if (last_thread) {
+    thread_group_destroy(thread_group);
+  }
 
   my_thread_end();
   return nullptr;
@@ -1547,8 +1543,6 @@ void tp_end_thread() {
     return;
   }
 
-  threadpool_thds.killConns();
-
   while (!threadpool_thds.empty()) {
     my_sleep(10000);
   }
@@ -1564,6 +1558,8 @@ void tp_end_thread() {
 
 void tp_end() {
   DBUG_ENTER("tp_end");
+  threadpool_thds.killConns();
+
   std::thread exit_tp(tp_end_thread);
   exit_tp.detach();
   DBUG_VOID_RETURN;
